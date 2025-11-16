@@ -1,0 +1,3 @@
+*.nemo
+.venv/
+__pycache__/

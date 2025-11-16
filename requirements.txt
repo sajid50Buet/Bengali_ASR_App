@@ -1,0 +1,7 @@
+nemo_toolkit[asr]
+fastapi
+python-multipart
+librosa
+soundfile
+uvicorn[standard]
+scipy

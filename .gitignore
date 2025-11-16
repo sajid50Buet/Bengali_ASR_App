@@ -1,3 +1,4 @@
 *.nemo
 .venv/
 __pycache__/
+temp_audio/

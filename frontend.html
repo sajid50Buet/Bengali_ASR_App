@@ -361,18 +361,28 @@
         </div>
 
         <!-- Streaming Section -->
-        <div id="streaming-section">
-            <h3>🎙️ Real-time Transcription</h3>
+        <div id="streaming-section" style="margin-top: 30px; padding: 25px; background: #f0f9ff; border-radius: 15px; border: 2px solid #667eea;">
+            <h3 style="margin-bottom: 15px; color: #333;">🎙️ Real-time Transcription</h3>
+            <p style="color: #666; font-size: 0.9rem; margin-bottom: 20px;">
+                Speak into your microphone for instant Bengali transcription
+            </p>
             
-            <!-- Enhancement Controls -->
-            <label><input type="checkbox" id="noiseSuppressCheck" checked> Noise Suppression</label>
-            <label><input type="checkbox" id="normalizeCheck" checked> Auto Volume</label>
-            <label>Target dB: <input type="range" id="targetDb" min="-30" max="-10" value="-20"></label>
+            <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+                <button id="startStream" onclick="startStreaming()" style="flex: 1; padding: 12px 20px; background: #10b981; color: white; border: none; border-radius: 10px; font-size: 1rem; font-weight: 600; cursor: pointer;">
+                    ▶️ Start Listening
+                </button>
+                <button id="stopStream" onclick="stopStreaming()" disabled style="flex: 1; padding: 12px 20px; background: #ef4444; color: white; border: none; border-radius: 10px; font-size: 1rem; font-weight: 600; cursor: pointer; opacity: 0.5;">
+                    ⏹️ Stop
+                </button>
+            </div>
             
-            <button id="startStream" onclick="startStreaming()">Start Listening</button>
-            <button id="stopStream" onclick="stopStreaming()" disabled>Stop</button>
-            <div id="streamStatus">Ready</div>
-            <div id="streamOutput"></div>
+            <div id="streamStatus" style="padding: 10px; background: #e0e7ff; border-radius: 8px; text-align: center; font-weight: 500; color: #4338ca;">
+                Ready
+            </div>
+            
+            <div id="streamOutput" style="margin-top: 15px; padding: 15px; background: white; border-radius: 10px; min-height: 150px; max-height: 300px; overflow-y: auto; font-family: 'Noto Sans Bengali', sans-serif; font-size: 1.1rem; line-height: 1.8; border: 1px solid #e5e7eb;">
+                <span style="color: #999;">Transcriptions will appear here...</span>
+            </div>
         </div>
 
         <!-- Status Messages -->
@@ -618,31 +628,45 @@
 
         async function startStreaming() {
             document.getElementById('startStream').disabled = true;
+            document.getElementById('startStream').style.opacity = '0.5';
             document.getElementById('stopStream').disabled = false;
-            document.getElementById('streamStatus').textContent = '🔴 Listening...';
-
-            const noiseSup = document.getElementById('noiseSuppressCheck').checked;
-            const normalize = document.getElementById('normalizeCheck').checked;
-            const targetDb = document.getElementById('targetDb').value;
+            document.getElementById('stopStream').style.opacity = '1';
+            document.getElementById('streamStatus').textContent = '🔴 Connecting...';
+            document.getElementById('streamStatus').style.background = '#fef3c7';
+            document.getElementById('streamStatus').style.color = '#92400e';
             
-            // Connect WebSocket
-            // Connect with query params
-            ws = new WebSocket(
-                `ws://${window.location.host}/ws/stream?noise_suppress=${noiseSup}&normalize=${normalize}&target_db=${targetDb}`
-            );
+            // Clear previous output
+            document.getElementById('streamOutput').innerHTML = '';
+            
+            // Simple WebSocket connection (no enhancement params needed)
+            ws = new WebSocket(`ws://${window.location.host}/ws/stream`);
+            
+            ws.onopen = () => {
+                document.getElementById('streamStatus').textContent = '🎤 Listening... Speak now!';
+                document.getElementById('streamStatus').style.background = '#d1fae5';
+                document.getElementById('streamStatus').style.color = '#065f46';
+            };
             
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 if (data.text && data.is_final) {
-                    // Add new line with timestamp
                     const output = document.getElementById('streamOutput');
+                    // Clear placeholder if first result
+                    if (output.innerHTML.includes('Transcriptions will appear')) {
+                        output.innerHTML = '';
+                    }
                     const timestamp = new Date().toLocaleTimeString();
-                    output.innerHTML += `<div>[${timestamp}] ${data.text}</div>`;
-                    // Auto-scroll to bottom
+                    output.innerHTML += `<div style="padding: 8px; margin: 5px 0; background: #f0f9ff; border-radius: 8px; border-left: 3px solid #667eea;">[${timestamp}] ${data.text}</div>`;
                     output.scrollTop = output.scrollHeight;
                 } else if (data.status === 'listening') {
-                    document.getElementById('streamStatus').textContent = `🎤 Listening... (${data.buffer_duration}s)`;
+                    document.getElementById('streamStatus').textContent = `🎤 Recording... (${data.buffer_duration}s)`;
                 }
+            };
+            
+            ws.onerror = (error) => {
+                document.getElementById('streamStatus').textContent = '❌ Connection error';
+                document.getElementById('streamStatus').style.background = '#fee2e2';
+                document.getElementById('streamStatus').style.color = '#991b1b';
             };
             
             ws.onclose = () => {
@@ -650,22 +674,38 @@
                 stopStreaming();
             };
             
-            // Start audio capture
-            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            audioContext = new AudioContext({ sampleRate: 16000 });
-            const source = audioContext.createMediaStreamSource(mediaStream);
-            
-            processor = audioContext.createScriptProcessor(4096, 1, 1);
-            processor.onaudioprocess = (e) => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    const float32Data = e.inputBuffer.getChannelData(0);
-                    const base64Audio = float32ToBase64(float32Data);
-                    ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
-                }
-            };
-            
-            source.connect(processor);
-            processor.connect(audioContext.destination);
+            try {
+                // Start audio capture at 16kHz
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true  // Browser's built-in noise suppression
+                    } 
+                });
+                
+                audioContext = new AudioContext({ sampleRate: 16000 });
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                processor.onaudioprocess = (e) => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        const float32Data = e.inputBuffer.getChannelData(0);
+                        const base64Audio = float32ToBase64(float32Data);
+                        ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
+                    }
+                };
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                
+            } catch (err) {
+                document.getElementById('streamStatus').textContent = '❌ Microphone access denied';
+                document.getElementById('streamStatus').style.background = '#fee2e2';
+                document.getElementById('streamStatus').style.color = '#991b1b';
+                stopStreaming();
+            }
         }
 
         function stopStreaming() {
@@ -673,13 +713,28 @@
                 ws.send(JSON.stringify({ type: 'stop' }));
                 ws.close();
             }
-            if (processor) processor.disconnect();
-            if (audioContext) audioContext.close();
-            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            ws = null;
+            
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(t => t.stop());
+                mediaStream = null;
+            }
             
             document.getElementById('startStream').disabled = false;
+            document.getElementById('startStream').style.opacity = '1';
             document.getElementById('stopStream').disabled = true;
+            document.getElementById('stopStream').style.opacity = '0.5';
             document.getElementById('streamStatus').textContent = 'Ready';
+            document.getElementById('streamStatus').style.background = '#e0e7ff';
+            document.getElementById('streamStatus').style.color = '#4338ca';
         }
 
         function float32ToBase64(float32Array) {

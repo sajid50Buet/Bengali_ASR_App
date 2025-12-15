@@ -18,46 +18,43 @@ from utils import (
     get_audio_duration, 
     log
 )
+from api_manager import ASRAPIManager
 
 # Global variables
 transcription_service = None
 diarized_service = None
 streaming_service = None
+api_manager = None
 
 # Set your HuggingFace token here (or use environment variable)
 HF_TOKEN = os.getenv("HF_TOKEN", None)  # or "hf_xxxxx"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global transcription_service, diarized_service, streaming_service
-
-    log("🚀 Initializing Bengali ASR Model...")
+    global transcription_service, diarized_service, streaming_service, api_manager
+    
+    log("🚀 Loading ASR Model...")
     transcription_service = TranscriptionService()
     
-    # Load Streaming Service (reuses ASR model)
-    log("🎙️ Initializing Streaming Service...")
-    streaming_service = StreamingTranscriptionService(asr_service=transcription_service)
-
+    log("📡 API Manager...")
+    api_manager = ASRAPIManager(transcription_service=transcription_service, max_concurrent=2)
     
-    # Load Diarization (reuse ASR model)
+    log("🎙️ Streaming Service...")
+    streaming_service = StreamingTranscriptionService(asr_service=transcription_service)
+    
     if HF_TOKEN:
-        log("🔊 Initializing Speaker Diarization...")
+        log("🔊 Diarization...")
         try:
-            # Pass existing ASR service instead of creating new one
             diarized_service = DiarizedTranscriptionService(
-                asr_service=transcription_service,  # Reuse!
+                asr_service=transcription_service,
                 hf_token=HF_TOKEN
             )
         except Exception as e:
-            log(f"⚠️ Diarization init failed: {e}. Continuing without it.")
+            log(f"⚠️ Diarization failed: {e}")
             diarized_service = None
-    else:
-        log("⚠️ HF_TOKEN not set. Diarization disabled.")
     
-    log("✅ Application startup complete!")
+    log("✅ Ready!")
     yield
-    log("👋 Shutting down...")
-
 
 app = FastAPI(title="Bengali Audio Transcription API", lifespan=lifespan)
 
@@ -178,138 +175,178 @@ async def health_check():
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
     """
-    Real-time streaming transcription with VAD and audio enhancement.
+    Simple real-time streaming - Original fast version.
     """
     await websocket.accept()
-    
-    # Parse query params manually from scope
-    query_string = websocket.scope.get("query_string", b"").decode()
-    params = dict(p.split("=") for p in query_string.split("&") if "=" in p)
-    noise_suppress = params.get("noise_suppress", "true").lower() == "true"
-    normalize = params.get("normalize", "true").lower() == "true"
-    target_db = float(params.get("target_db", "-20"))
-    
-    log(f"🔌 WebSocket connected (noise_suppress={noise_suppress}, normalize={normalize})")
+    log("🔌 WebSocket connected")
     
     audio_buffer = np.array([], dtype=np.float32)
-    pending_audio = np.array([], dtype=np.float32)
     pre_buffer = np.array([], dtype=np.float32)
-    enhance_buffer = np.array([], dtype=np.float32)
     silence_frames = 0
     speech_started = False
     
-    SILENCE_THRESHOLD = 30
-    MIN_SPEECH_DURATION = 0.3
     VAD_CHUNK_SIZE = 512
-    PRE_BUFFER_CHUNKS = 20
-    ENHANCE_CHUNK_SIZE = 4096
+    SILENCE_THRESHOLD = 15        # ~0.5s silence
+    PRE_BUFFER_CHUNKS = 20        # ~0.6s lookback
     
     try:
         while True:
-            try:
-                # Non-blocking receive with timeout
-                data = await asyncio.wait_for(
-                    websocket.receive_json(), 
-                    timeout=0.1
-                )
-            except asyncio.TimeoutError:
-                continue
-            except Exception:
-                break
+            data = await websocket.receive_json()
             
             if data.get("type") == "audio":
-                audio_bytes = base64.b64decode(data["audio"])
-                chunk = np.frombuffer(audio_bytes, dtype=np.float32)
-                enhance_buffer = np.concatenate([enhance_buffer, chunk])
+                chunk = np.frombuffer(base64.b64decode(data["audio"]), dtype=np.float32)
+                pre_buffer = np.concatenate([pre_buffer, chunk])
                 
-                # Enhance in batches
-                while len(enhance_buffer) >= ENHANCE_CHUNK_SIZE:
-                    raw_chunk = enhance_buffer[:ENHANCE_CHUNK_SIZE]
-                    enhance_buffer = enhance_buffer[ENHANCE_CHUNK_SIZE:]
+                # Process 512-sample chunks for VAD
+                while len(pre_buffer) >= VAD_CHUNK_SIZE:
+                    vad_chunk = pre_buffer[:VAD_CHUNK_SIZE]
+                    pre_buffer = pre_buffer[VAD_CHUNK_SIZE:]
                     
-                    if noise_suppress or normalize:
-                        enhanced_chunk = streaming_service.enhancer.enhance_chunk(
-                            raw_chunk,
-                            suppress_noise=noise_suppress,
-                            normalize_volume=normalize,
-                            target_db=target_db
-                        )
-                    else:
-                        enhanced_chunk = raw_chunk
-                    
-                    pending_audio = np.concatenate([pending_audio, enhanced_chunk])
-                
-                # VAD processing
-                while len(pending_audio) >= VAD_CHUNK_SIZE:
-                    vad_chunk = pending_audio[:VAD_CHUNK_SIZE]
-                    pending_audio = pending_audio[VAD_CHUNK_SIZE:]
-                    
+                    # VAD check
                     import torch
-                    chunk_tensor = torch.from_numpy(vad_chunk.copy())
-                    speech_prob = streaming_service.vad_model(chunk_tensor, 16000).item()
+                    speech_prob = streaming_service.vad_model(
+                        torch.from_numpy(vad_chunk), 16000
+                    ).item()
                     
                     if speech_prob > 0.5:
+                        silence_frames = 0
                         if not speech_started:
-                            audio_buffer = np.concatenate([pre_buffer, vad_chunk])
-                            pre_buffer = np.array([], dtype=np.float32)
                             speech_started = True
                             log("🎤 Speech started")
-                        else:
-                            audio_buffer = np.concatenate([audio_buffer, vad_chunk])
-                        silence_frames = 0
+                        audio_buffer = np.concatenate([audio_buffer, vad_chunk])
                         
                     elif speech_started:
                         audio_buffer = np.concatenate([audio_buffer, vad_chunk])
                         silence_frames += 1
                         
                         if silence_frames >= SILENCE_THRESHOLD:
-                            if len(audio_buffer) > MIN_SPEECH_DURATION * 16000:
-                                log(f"🔄 Transcribing {len(audio_buffer)/16000:.2f}s of audio...")
+                            if len(audio_buffer) > 4800:  # > 300ms
                                 text = streaming_service.transcribe_buffer(audio_buffer)
-                                log(f"✅ Transcribed: {text[:50]}...")
-                                
-                                await websocket.send_json({
-                                    "text": text,
-                                    "is_final": True,
-                                    "duration": round(len(audio_buffer) / 16000, 2)
-                                })
+                                if text.strip():
+                                    log(f"✅ {text}")
+                                    await websocket.send_json({"text": text, "is_final": True})
                             
-                            # Reset for next utterance
                             audio_buffer = np.array([], dtype=np.float32)
                             silence_frames = 0
                             speech_started = False
-                            log("🔁 Ready for next utterance")
-                    else:
-                        pre_buffer = np.concatenate([pre_buffer, vad_chunk])
-                        max_pre_buffer = VAD_CHUNK_SIZE * PRE_BUFFER_CHUNKS
-                        if len(pre_buffer) > max_pre_buffer:
-                            pre_buffer = pre_buffer[-max_pre_buffer:]
-                
-                if speech_started:
-                    await websocket.send_json({
-                        "status": "listening",
-                        "buffer_duration": round(len(audio_buffer) / 16000, 2)
-                    })
-                        
+                            
             elif data.get("type") == "stop":
-                if len(audio_buffer) > MIN_SPEECH_DURATION * 16000:
+                if len(audio_buffer) > 4800:
                     text = streaming_service.transcribe_buffer(audio_buffer)
-                    await websocket.send_json({
-                        "text": text,
-                        "is_final": True,
-                        "duration": round(len(audio_buffer) / 16000, 2)
-                    })
+                    if text.strip():
+                        await websocket.send_json({"text": text, "is_final": True})
                 break
                 
     except WebSocketDisconnect:
-        log("🔌 WebSocket disconnected")
+        log("🔌 Disconnected")
     except Exception as e:
-        log(f"❌ WebSocket error: {e}")
+        log(f"❌ Error: {e}")
+
+# ============== PRODUCTION API ENDPOINTS ==============
+
+@app.post("/api/v1/transcribe")
+async def api_transcribe(audio: UploadFile = File(...)):
+    """
+    Production API endpoint for transcription.
+    Handles queuing and concurrency automatically.
+    """
+    log(f"📨 API Request: {audio.filename}")
+    
+    if not audio.filename.endswith(('.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm')):
+        raise HTTPException(status_code=400, detail="Invalid file format")
+    
+    audio_path = None
+    try:
+        audio_path = await save_uploaded_file(audio)
+        result = await api_manager.transcribe_sync(audio_path)
+        
+        return JSONResponse(content={
+            "transcription": result["text"],
+            "processing_time": result["processing_time"],
+            "status": "success"
+        })
+    
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="Request timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        try:
-            await websocket.close()
-        except:
-            pass
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except:
+                pass
+
+
+@app.post("/api/v1/transcribe/async")
+async def api_transcribe_async(audio: UploadFile = File(...)):
+    """
+    Async API - returns job_id immediately.
+    Poll /api/v1/job/{job_id} for result.
+    """
+    if not audio.filename.endswith(('.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm')):
+        raise HTTPException(status_code=400, detail="Invalid file format")
+    
+    audio_path = await save_uploaded_file(audio)
+    job_id = await api_manager.submit_job(audio_path)
+    
+    return JSONResponse(content={
+        "job_id": job_id,
+        "status": "queued",
+        "poll_url": f"/api/v1/job/{job_id}"
+    })
+
+
+@app.get("/api/v1/job/{job_id}")
+async def get_job_status(job_id: str):
+    """Get status of async transcription job"""
+    job = await api_manager.get_job_status(job_id)
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    response = {
+        "job_id": job.job_id,
+        "status": job.status,
+        "created_at": job.created_at.isoformat()
+    }
+    
+    if job.status == "completed":
+        response["result"] = {
+            "transcription": job.result["text"],
+            "processing_time": job.result["processing_time"]
+        }
+        response["completed_at"] = job.completed_at.isoformat()
+    elif job.status == "failed":
+        response["error"] = job.error
+    
+    return JSONResponse(content=response)
+
+
+@app.get("/api/v1/stats")
+async def get_api_stats():
+    """Get API usage statistics"""
+    return JSONResponse(content=api_manager.get_stats())
+
+
+@app.get("/api/v1/health")
+async def api_health():
+    """Detailed health check for load balancers"""
+    stats = api_manager.get_stats()
+    
+    # Healthy if not overloaded
+    is_healthy = stats["active"] < stats["max_concurrent"]
+    
+    return JSONResponse(
+        content={
+            "status": "healthy" if is_healthy else "overloaded",
+            "model_loaded": transcription_service is not None,
+            "active_requests": stats["active"],
+            "max_concurrent": stats["max_concurrent"],
+            "total_processed": stats["completed"]
+        },
+        status_code=200 if is_healthy else 503
+    )
 
 if __name__ == "__main__":
     import uvicorn

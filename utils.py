@@ -445,94 +445,56 @@ def cleanup_temp_files(max_age_hours: int = 24):
 # ============== REAL-TIME AUDIO ENHANCEMENT ==============
 
 class AudioEnhancer:
-    """Real-time noise suppression and voice amplification"""
+    """Real-time noise suppression and voice amplification - Lightweight version"""
     
     def __init__(self):
-        log("Loading audio enhancement models...")
-        
-        self.use_deep_filter = False
-        self.df_model = None
-        self.df_state = None
-        
-        try:
-            from df import enhance, init_df
-            self.df_model, self.df_state, _ = init_df()
-            self.use_deep_filter = True
-            self.df_sr = 48000  # DeepFilterNet expects 48kHz
-            log("✅ DeepFilterNet loaded (high-quality noise suppression)")
-        except ImportError:
-            log("⚠️ DeepFilterNet not available, using noisereduce")
-        except Exception as e:
-            log(f"⚠️ DeepFilterNet init failed: {e}, using noisereduce")
-        
+        log("Loading audio enhancement (lightweight mode)...")
         self.sample_rate = 16000
         self.target_db = -20
-        log("✅ Audio enhancer ready!")
+        
+        # Pre-import noisereduce
+        try:
+            import noisereduce as nr
+            self.nr = nr
+            log("✅ Audio enhancer ready (noisereduce)")
+        except ImportError:
+            log("⚠️ noisereduce not installed. Run: pip install noisereduce")
+            self.nr = None
     
     def enhance_chunk(self, audio: np.ndarray, 
                       suppress_noise: bool = True,
                       normalize_volume: bool = True,
                       target_db: float = -20) -> np.ndarray:
-        """
-        Enhance audio chunk in real-time.
-        """
+        """Enhance audio chunk in real-time."""
         if len(audio) < 512:
             return audio
         
         enhanced = audio.copy()
         
         try:
-            if suppress_noise:
+            if suppress_noise and self.nr is not None:
                 enhanced = self._suppress_noise(enhanced)
             
             if normalize_volume:
                 enhanced = self._normalize_volume(enhanced, target_db)
         except Exception as e:
-            log(f"⚠️ Enhancement error: {e}")
-            return audio
+            # Fail silently, return original
+            pass
         
         return enhanced
     
     def _suppress_noise(self, audio: np.ndarray) -> np.ndarray:
-        """Apply noise suppression"""
-        try:
-            if self.use_deep_filter and self.df_model is not None:
-                from df import enhance
-                import torch
-                
-                # DeepFilterNet needs 48kHz - resample up, process, resample down
-                audio_48k = librosa.resample(audio, orig_sr=16000, target_sr=48000)
-                
-                # DeepFilterNet expects 2D tensor: (1, samples)
-                audio_tensor = torch.from_numpy(audio_48k).float().unsqueeze(0)
-                
-                # Enhance
-                enhanced_48k = enhance(self.df_model, self.df_state, audio_tensor)
-                
-                # Handle tensor output
-                if isinstance(enhanced_48k, torch.Tensor):
-                    enhanced_48k = enhanced_48k.squeeze().cpu().numpy()
-                else:
-                    enhanced_48k = np.array(enhanced_48k).flatten()
-                
-                # Resample back to 16kHz
-                enhanced = librosa.resample(enhanced_48k, orig_sr=48000, target_sr=16000)
-                
-                return enhanced.astype(np.float32)
-            else:
-                # Fallback to noisereduce
-                import noisereduce as nr
-                return nr.reduce_noise(
-                    y=audio, 
-                    sr=self.sample_rate,
-                    stationary=False,
-                    prop_decrease=0.75,
-                    n_fft=512,
-                    hop_length=128
-                ).astype(np.float32)
-        except Exception as e:
-            log(f"⚠️ Noise suppression failed: {e}")
-            return audio
+        """Light noise suppression using noisereduce"""
+        # Use stationary mode for speed, less aggressive
+        return self.nr.reduce_noise(
+            y=audio, 
+            sr=self.sample_rate,
+            stationary=True,       # Faster than non-stationary
+            prop_decrease=0.6,     # Less aggressive (was 0.75)
+            n_fft=512,
+            hop_length=256,        # Larger hop = faster
+            n_std_thresh_stationary=1.5
+        ).astype(np.float32)
     
     def _normalize_volume(self, audio: np.ndarray, target_db: float = -20) -> np.ndarray:
         """Normalize volume with soft limiting"""
@@ -542,66 +504,61 @@ class AudioEnhancer:
         
         current_db = 20 * np.log10(rms + 1e-8)
         gain_db = target_db - current_db
-        gain_db = np.clip(gain_db, -20, 30)
+        gain_db = np.clip(gain_db, -10, 20)  # More conservative gain limits
         gain = 10 ** (gain_db / 20)
         
         amplified = audio * gain
-        amplified = np.tanh(amplified * 0.9) / 0.9
+        
+        # Soft clipping
+        amplified = np.clip(amplified, -1.0, 1.0)
         
         return amplified.astype(np.float32)
     
 # ============== STREAMING ASR SERVICE ==============
 
 class StreamingTranscriptionService:
-    """Real-time streaming ASR with VAD and audio enhancement"""
+    """Simple streaming ASR with VAD - Fast version"""
     
     def __init__(self, asr_service: TranscriptionService):
         self.asr_service = asr_service
         self.sample_rate = 16000
         
-        # Load Silero VAD
         log("Loading Silero VAD model...")
-        import torch
-        self.vad_model, self.vad_utils = torch.hub.load(
+        self.vad_model, _ = torch.hub.load(
             repo_or_dir='snakers4/silero-vad',
             model='silero_vad',
             force_reload=False
         )
-        log("✅ VAD model loaded!")
-        
-        # Load Audio Enhancer
-        self.enhancer = AudioEnhancer()
-        
-    def detect_speech_end(self, audio_chunk: np.ndarray, threshold: float = 0.5) -> bool:
-        """Check if speech has ended in the audio chunk"""
-        import torch
-        if len(audio_chunk) < 512:
-            return False
-        
-        audio_tensor = torch.from_numpy(audio_chunk.astype(np.float32))
-        check_samples = min(len(audio_tensor), int(0.5 * self.sample_rate))
-        chunk_to_check = audio_tensor[-check_samples:]
-        
-        speech_prob = self.vad_model(chunk_to_check, self.sample_rate).item()
-        return speech_prob < threshold
+        log("✅ VAD loaded!")
     
     def transcribe_buffer(self, audio_buffer: np.ndarray) -> str:
-        """Transcribe accumulated audio buffer"""
-        if len(audio_buffer) < self.sample_rate * 0.3:
+        if len(audio_buffer) < 4800:
             return ""
         
-        temp_path = Path("temp_streaming") / f"stream_{int(time.time()*1000)}.wav"
+        temp_path = Path("temp_streaming") / f"{int(time.time()*1000)}.wav"
         temp_path.parent.mkdir(exist_ok=True)
         
         try:
             sf.write(str(temp_path), audio_buffer, self.sample_rate)
             result = self.asr_service.model.transcribe([str(temp_path)])
-            
-            if isinstance(result, list) and len(result) > 0:
-                text = result[0].text if hasattr(result[0], 'text') else str(result[0])
-            else:
-                text = str(result)
-            return text.strip()
+            if isinstance(result, list) and result:
+                return (result[0].text if hasattr(result[0], 'text') else str(result[0])).strip()
+            return ""
         finally:
-            if temp_path.exists():
-                temp_path.unlink()
+            temp_path.unlink(missing_ok=True)
+
+def get_gpu_memory_info():
+    """Check available GPU memory"""
+    import torch
+    if torch.cuda.is_available():
+        gpu = torch.cuda.get_device_properties(0)
+        total = gpu.total_memory / 1024**3  # GB
+        used = torch.cuda.memory_allocated() / 1024**3
+        free = total - used
+        return {
+            "total_gb": round(total, 2),
+            "used_gb": round(used, 2),
+            "free_gb": round(free, 2),
+            "recommended_concurrent": max(1, int(free // 2))  # ~2GB per request
+        }
+    return {"error": "No GPU available"}

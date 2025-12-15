@@ -7,236 +7,601 @@ from fastapi import UploadFile
 import librosa
 import nemo.collections.asr as nemo_asr
 import torch
+import soundfile as sf
+import numpy as np
 
 def log(message):
     """Print message with timestamp"""
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{timestamp}] {message}")
 
+
 class TranscriptionService:
     """Service for handling Bengali audio transcription"""
     
     def __init__(self, model_path: str = None):
-        """
-        Initialize the transcription model
-        
-        Args:
-            model_path: Path to the .nemo model file
-        """
         if model_path is None:
-            # Look for .nemo file in current directory
             nemo_files = list(Path('.').glob('*.nemo'))
             if not nemo_files:
-                raise FileNotFoundError("No .nemo model file found! Please provide model_path or place a .nemo file in the current directory.")
+                raise FileNotFoundError("No .nemo model file found!")
             model_path = str(nemo_files[0])
         
         log(f"Loading NeMo model: {model_path}")
-        
-        # Check if CUDA is available
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         log(f"Using device: {self.device}")
         
-        # Load model
         self.model = nemo_asr.models.ASRModel.restore_from(model_path)
-        
-        # Move model to GPU if available
         if self.device == "cuda":
             self.model = self.model.cuda()
-        
-        # Set model to eval mode for faster inference
         self.model.eval()
-        
-        # Disable gradients for faster inference
         torch.set_grad_enabled(False)
-        
         log("✅ Model loaded successfully!")
     
-    def transcribe(self, audio_path: str) -> dict:
-        """
-        Transcribe audio file to text
+    def split_audio_with_overlap(self, audio, sr, chunk_duration=8.0, overlap=1.0):
+        chunk_samples = int(chunk_duration * sr)
+        overlap_samples = int(overlap * sr)
+        stride = chunk_samples - overlap_samples
         
-        Args:
-            audio_path: Path to the audio file
+        chunks = []
+        start = 0
+        
+        while start < len(audio):
+            end = min(start + chunk_samples, len(audio))
+            chunk = audio[start:end]
             
-        Returns:
-            dict with 'text' and 'processing_time'
+            if len(chunk) < chunk_samples * 0.1:
+                break
+            
+            chunks.append(chunk)
+            start += stride
+        
+        return chunks
+    
+    def merge_transcriptions_lcs(self, transcriptions: list) -> str:
         """
+        Merge overlapping transcriptions using Longest Common Subsequence (LCS)
+        algorithm at word level to remove duplicated text from overlap regions.
+        Based on NVIDIA's approach in parakeet_tdt.pdf
+        """
+        if not transcriptions:
+            return ""
+        if len(transcriptions) == 1:
+            return transcriptions[0]
+        
+        def lcs_words(seq1: list, seq2: list) -> list:
+            """Find Longest Common Subsequence of two word lists"""
+            m, n = len(seq1), len(seq2)
+            
+            # Create DP table
+            dp = [[0] * (n + 1) for _ in range(m + 1)]
+            
+            for i in range(1, m + 1):
+                for j in range(1, n + 1):
+                    if seq1[i-1] == seq2[j-1]:
+                        dp[i][j] = dp[i-1][j-1] + 1
+                    else:
+                        dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+            
+            # Backtrack to find LCS
+            lcs = []
+            i, j = m, n
+            while i > 0 and j > 0:
+                if seq1[i-1] == seq2[j-1]:
+                    lcs.append((i-1, j-1, seq1[i-1]))
+                    i -= 1
+                    j -= 1
+                elif dp[i-1][j] > dp[i][j-1]:
+                    i -= 1
+                else:
+                    j -= 1
+            
+            return list(reversed(lcs))
+        
+        def find_overlap_point(prev_words: list, curr_words: list, max_overlap: int = 25) -> tuple:
+            """
+            Find the best overlap point between end of prev and start of curr
+            Returns (prev_end_idx, curr_start_idx)
+            """
+            # Look at last N words of prev and first N words of curr
+            check_prev = prev_words[-max_overlap:] if len(prev_words) > max_overlap else prev_words
+            check_curr = curr_words[:max_overlap] if len(curr_words) > max_overlap else curr_words
+            
+            # Find LCS
+            lcs = lcs_words(check_prev, check_curr)
+            
+            if len(lcs) >= 2:  # Need at least 2 matching words to be confident
+                # Find the offset for prev_words if we sliced it
+                prev_offset = len(prev_words) - len(check_prev)
+                
+                # Get the last match point
+                last_match = lcs[-1]
+                prev_idx = prev_offset + last_match[0]  # Index in original prev_words
+                curr_idx = last_match[1]  # Index in curr_words
+                
+                return (prev_idx + 1, curr_idx + 1)  # +1 because we want to exclude the matched word from curr
+            
+            return (len(prev_words), 0)  # No overlap found, just concatenate
+        
+        # Merge all transcriptions
+        merged_words = transcriptions[0].split()
+        
+        for i in range(1, len(transcriptions)):
+            curr_words = transcriptions[i].split()
+            
+            if not curr_words:
+                continue
+            
+            if not merged_words:
+                merged_words = curr_words
+                continue
+            
+            # Find overlap point
+            prev_end, curr_start = find_overlap_point(merged_words, curr_words)
+            
+            # Merge: keep prev up to overlap, then add curr from overlap
+            merged_words = merged_words[:prev_end] + curr_words[curr_start:]
+        
+        return " ".join(merged_words)
+
+    def transcribe(self, audio_path: str, max_duration: float = 300.0) -> dict:
         try:
             log(f"🎤 Starting transcription: {audio_path}")
             start_time = time.time()
             
-            # Transcribe - just pass list of audio files
-            transcriptions = self.model.transcribe([audio_path])
+            audio_info = sf.info(audio_path)
+            duration = audio_info.duration
+            log(f"⏱️  Audio duration: {duration:.2f}s")
+            
+            if duration <= max_duration:
+                log(f"   Direct transcription (audio ≤ {max_duration}s)")
+                transcriptions = self.model.transcribe([audio_path])
+                
+                if isinstance(transcriptions, list) and len(transcriptions) > 0:
+                    result = transcriptions[0]
+                    text = result.text if hasattr(result, 'text') else str(result)
+                else:
+                    text = str(transcriptions)
+            else:
+                log(f"   Long audio detected! Using chunking...")
+                text = self._transcribe_long_audio(audio_path, duration)
             
             processing_time = time.time() - start_time
-            
-            # Extract text - NeMo returns different types depending on model
-            if isinstance(transcriptions, list) and len(transcriptions) > 0:
-                result = transcriptions[0]
-                # Handle Hypothesis object
-                if hasattr(result, 'text'):
-                    text = result.text
-                else:
-                    text = str(result)
-            else:
-                text = str(transcriptions)
-            
             log(f"✅ Transcription completed in {processing_time:.2f}s")
-            log(f"📝 Result: {text[:100]}..." if len(text) > 100 else f"📝 Result: {text}")
             
-            return {
-                "text": text,
-                "processing_time": processing_time
-            }
+            return {"text": text, "processing_time": processing_time}
         except Exception as e:
             log(f"❌ Error during transcription: {str(e)}")
             raise Exception(f"Transcription failed: {str(e)}")
+    
+    def _transcribe_long_audio(self, audio_path: str, duration: float) -> str:
+        audio, sr = librosa.load(audio_path, sr=16000, mono=True)
+        chunks = self.split_audio_with_overlap(audio, sr, chunk_duration=300.0, overlap=1.0)
+        log(f"   Split into {len(chunks)} chunks")
+        
+        temp_dir = Path("temp_chunks")
+        temp_dir.mkdir(exist_ok=True)
+        
+        transcriptions = []
+        
+        for i, chunk in enumerate(chunks):
+            log(f"   Transcribing chunk {i+1}/{len(chunks)}...")
+            chunk_path = temp_dir / f"chunk_{i}_{int(time.time()*1000)}.wav"
+            sf.write(str(chunk_path), chunk, sr)
+            
+            try:
+                result = self.model.transcribe([str(chunk_path)])
+                if isinstance(result, list) and len(result) > 0:
+                    chunk_result = result[0]
+                    chunk_text = chunk_result.text if hasattr(chunk_result, 'text') else str(chunk_result)
+                else:
+                    chunk_text = str(result)
+                transcriptions.append(chunk_text)
+            finally:
+                if chunk_path.exists():
+                    chunk_path.unlink()
+        
+        try:
+            temp_dir.rmdir()
+        except:
+            pass
+        
+        return self.merge_transcriptions_lcs(transcriptions)
 
+
+class DiarizedTranscriptionService:
+    """Speaker diarization + transcription with timestamps"""
+    
+    def __init__(self, asr_model_path: str = None, hf_token: str = None, asr_service: TranscriptionService = None):
+        # Use existing ASR service or create new one
+        if asr_service:
+            self.asr_service = asr_service
+        else:
+            self.asr_service = TranscriptionService(asr_model_path)
+        
+        # Initialize Diarization
+        log("Loading pyannote diarization model...")
+        from pyannote.audio import Pipeline as DiarizationPipeline
+        
+        # Fix for PyTorch 2.6+ weights_only issue - monkey patch torch.load
+        _original_torch_load = torch.load
+        
+        def _patched_torch_load(*args, **kwargs):
+            kwargs['weights_only'] = False
+            return _original_torch_load(*args, **kwargs)
+        
+        torch.load = _patched_torch_load
+        
+        try:
+            self.diarization = DiarizationPipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token
+            )
+        finally:
+            torch.load = _original_torch_load  # Restore original
+        
+        if torch.cuda.is_available():
+            self.diarization.to(torch.device("cuda"))
+        
+        log("✅ Diarization model loaded!")
+        
+    def transcribe_with_diarization(
+        self, 
+        audio_path: str, 
+        min_segment_duration: float = 0.5,
+        merge_same_speaker: bool = True,
+        gap_threshold: float = 0.5
+    ) -> dict:
+        """
+        Transcribe audio with speaker labels and timestamps
+        
+        Args:
+            audio_path: Path to audio file
+            min_segment_duration: Minimum segment length (seconds)
+            merge_same_speaker: Merge adjacent same-speaker segments
+            gap_threshold: Max gap to merge same-speaker segments
+        
+        Returns:
+            dict with 'segments', 'full_text', 'processing_time', 'num_speakers'
+        """
+        log(f"🎤 Starting diarized transcription: {audio_path}")
+        start_time = time.time()
+        
+        # Step 1: Run diarization
+        log("🔍 Running speaker diarization...")
+        diarization_result = self.diarization(audio_path)
+        
+        # Step 2: Extract speaker segments
+        segments = []
+        for turn, _, speaker in diarization_result.itertracks(yield_label=True):
+            if turn.duration < min_segment_duration:
+                continue
+            segments.append({
+                "speaker": speaker,
+                "start": turn.start,
+                "end": turn.end,
+                "duration": turn.duration
+            })
+        
+        log(f"   Found {len(segments)} speaker segments")
+        
+        # Step 3: Load audio
+        audio, sr = librosa.load(audio_path, sr=16000, mono=True)
+        
+        # Step 4: Transcribe each segment
+        temp_dir = Path("temp_diarization")
+        temp_dir.mkdir(exist_ok=True)
+        
+        results = []
+        for i, seg in enumerate(segments):
+            log(f"   [{i+1}/{len(segments)}] {seg['speaker']} ({seg['start']:.1f}s-{seg['end']:.1f}s)")
+            
+            start_sample = int(seg["start"] * sr)
+            end_sample = int(seg["end"] * sr)
+            segment_audio = audio[start_sample:end_sample]
+            
+            segment_path = temp_dir / f"seg_{i}_{int(time.time()*1000)}.wav"
+            sf.write(str(segment_path), segment_audio, sr)
+            
+            try:
+                transcription = self.asr_service.model.transcribe([str(segment_path)])
+                if isinstance(transcription, list) and len(transcription) > 0:
+                    result = transcription[0]
+                    text = result.text if hasattr(result, 'text') else str(result)
+                else:
+                    text = str(transcription)
+                
+                results.append({
+                    "speaker": seg["speaker"],
+                    "start": round(seg["start"], 2),
+                    "end": round(seg["end"], 2),
+                    "text": text.strip()
+                })
+            finally:
+                if segment_path.exists():
+                    segment_path.unlink()
+        
+        try:
+            temp_dir.rmdir()
+        except:
+            pass
+        
+        # Step 5: Optionally merge same-speaker segments
+        if merge_same_speaker:
+            results = self._merge_same_speaker(results, gap_threshold)
+        
+        # Step 6: Format output
+        full_text = self._format_output(results)
+        processing_time = time.time() - start_time
+        
+        log(f"✅ Diarized transcription completed in {processing_time:.2f}s")
+        
+        return {
+            "segments": results,
+            "full_text": full_text,
+            "processing_time": processing_time,
+            "num_speakers": len(set(r["speaker"] for r in results))
+        }
+    
+    def _merge_same_speaker(self, segments: list, gap_threshold: float = 0.5) -> list:
+        """Merge adjacent segments from same speaker if gap < threshold"""
+        if not segments:
+            return segments
+        
+        merged = [segments[0].copy()]
+        
+        for seg in segments[1:]:
+            last = merged[-1]
+            gap = seg["start"] - last["end"]
+            
+            if seg["speaker"] == last["speaker"] and gap < gap_threshold:
+                last["end"] = seg["end"]
+                last["text"] += " " + seg["text"]
+            else:
+                merged.append(seg.copy())
+        
+        return merged
+    
+    def _format_output(self, results: list) -> str:
+        """Format results with speaker labels and timestamps"""
+        lines = []
+        for r in results:
+            timestamp = f"[{r['start']:.1f}s - {r['end']:.1f}s]"
+            lines.append(f"{timestamp} {r['speaker']}: {r['text']}")
+        return "\n".join(lines)
+
+
+# ============== UTILITY FUNCTIONS ==============
 
 async def save_uploaded_file(upload_file: UploadFile) -> str:
-    """
-    Save uploaded file to temporary location and convert to 16kHz mono WAV
-    
-    Args:
-        upload_file: FastAPI UploadFile object
-        
-    Returns:
-        Path to the saved file
-    """
-    import soundfile as sf
-    import wave
+    """Save uploaded file and convert to 16kHz mono WAV"""
     import subprocess
     
-    # Create temp directory if it doesn't exist
     temp_dir = Path("temp_audio")
     temp_dir.mkdir(exist_ok=True)
     
-    # Generate unique filename
     timestamp = int(time.time() * 1000)
-    temp_input_path = temp_dir / f"{timestamp}_input"
     temp_output_path = temp_dir / f"{timestamp}.wav"
     
     log(f"📥 Saving uploaded file: {upload_file.filename}")
     
-    # Read file content
-    try:
-        content = await upload_file.read()
-        log(f"✅ File read: {len(content)} bytes")
-    except Exception as e:
-        log(f"❌ Error reading file: {str(e)}")
-        raise Exception(f"Error reading file: {str(e)}")
+    content = await upload_file.read()
+    log(f"✅ File read: {len(content)} bytes")
     
-    # Check if it's WebM (browser recording)
     is_webm = content[:4] == b'\x1a\x45\xdf\xa3'
+    ext = ".webm" if is_webm else ".wav"
+    temp_input_path = temp_dir / f"{timestamp}_input{ext}"
     
-    if is_webm:
-        log(f"   Detected WebM format (browser recording)")
-        # Save as .webm
-        temp_input_path = temp_dir / f"{timestamp}_input.webm"
-    else:
-        # Save with original-like extension
-        temp_input_path = temp_dir / f"{timestamp}_input.wav"
+    with open(temp_input_path, "wb") as f:
+        f.write(content)
     
-    # Save uploaded file
-    try:
-        with open(temp_input_path, "wb") as f:
-            f.write(content)
-        log(f"✅ File saved to: {temp_input_path}")
-    except Exception as e:
-        log(f"❌ Error saving file: {str(e)}")
-        raise Exception(f"Error saving file: {str(e)}")
+    time.sleep(0.05)
     
-    # Small delay to ensure file is released on Windows
-    import time as time_module
-    time_module.sleep(0.05)
-    
-    # Try to convert audio
     try:
         log(f"🔄 Converting audio to 16kHz mono WAV...")
-        convert_start = time.time()
+        result = subprocess.run([
+            'ffmpeg', '-i', str(temp_input_path),
+            '-ar', '16000', '-ac', '1',
+            '-loglevel', 'error', '-y',
+            str(temp_output_path)
+        ], capture_output=True, text=True, timeout=30)
         
-        # Always use FFmpeg - it's faster and more reliable
-        log(f"   Using FFmpeg to convert audio...")
-        try:
-            result = subprocess.run([
-                'ffmpeg', '-i', str(temp_input_path),
-                '-ar', '16000',  # Sample rate 16kHz
-                '-ac', '1',      # Mono
-                '-loglevel', 'error',  # Only show errors
-                '-y',            # Overwrite output file
-                str(temp_output_path)
-            ], capture_output=True, text=True, timeout=30)
-            
-            if result.returncode != 0:
-                raise Exception(f"FFmpeg failed: {result.stderr}")
-            
-            convert_time = time.time() - convert_start
-            log(f"✅ Converted using FFmpeg in {convert_time:.2f}s!")
-            
-        except FileNotFoundError:
-            raise Exception(
-                "FFmpeg not found! Please make sure FFmpeg is installed and in PATH. "
-                "Restart your terminal after installing FFmpeg."
-            )
+        if result.returncode != 0:
+            raise Exception(f"FFmpeg failed: {result.stderr}")
         
-        # Clean up input file
+        log(f"✅ Converted successfully!")
+    finally:
         if temp_input_path.exists():
             temp_input_path.unlink()
-        
-        return str(temp_output_path)
-        
-    except Exception as e:
-        print(f"❌ Error converting audio: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        # Clean up on error
-        if temp_input_path.exists():
-            temp_input_path.unlink()
-        if temp_output_path.exists():
-            temp_output_path.unlink()
-        raise Exception(f"Error converting audio: {str(e)}")
+    
+    return str(temp_output_path)
 
 
 def get_audio_duration(audio_path: str) -> float:
-    """
-    Get the duration of an audio file in seconds
-    
-    Args:
-        audio_path: Path to the audio file
-        
-    Returns:
-        Duration in seconds
-    """
     try:
-        duration = librosa.get_duration(path=audio_path)
-        log(f"⏱️ Audio duration: {duration:.2f}s")
-        return duration
-    except Exception as e:
-        log(f"⚠️ Error getting audio duration: {e}")
+        return librosa.get_duration(path=audio_path)
+    except:
         return 0.0
 
 
 def cleanup_temp_files(max_age_hours: int = 24):
-    """
-    Clean up old temporary audio files
+    for temp_dir in ["temp_audio", "temp_chunks", "temp_diarization"]:
+        temp_path = Path(temp_dir)
+        if not temp_path.exists():
+            continue
+        
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+        
+        for file_path in temp_path.glob("*"):
+            if file_path.is_file():
+                if current_time - file_path.stat().st_mtime > max_age_seconds:
+                    try:
+                        file_path.unlink()
+                    except:
+                        pass
+
+
+
+# ============== REAL-TIME AUDIO ENHANCEMENT ==============
+
+class AudioEnhancer:
+    """Real-time noise suppression and voice amplification"""
     
-    Args:
-        max_age_hours: Maximum age of files to keep in hours
-    """
-    temp_dir = Path("temp_audio")
-    if not temp_dir.exists():
-        return
+    def __init__(self):
+        log("Loading audio enhancement models...")
+        
+        self.use_deep_filter = False
+        self.df_model = None
+        self.df_state = None
+        
+        try:
+            from df import enhance, init_df
+            self.df_model, self.df_state, _ = init_df()
+            self.use_deep_filter = True
+            self.df_sr = 48000  # DeepFilterNet expects 48kHz
+            log("✅ DeepFilterNet loaded (high-quality noise suppression)")
+        except ImportError:
+            log("⚠️ DeepFilterNet not available, using noisereduce")
+        except Exception as e:
+            log(f"⚠️ DeepFilterNet init failed: {e}, using noisereduce")
+        
+        self.sample_rate = 16000
+        self.target_db = -20
+        log("✅ Audio enhancer ready!")
     
-    current_time = time.time()
-    max_age_seconds = max_age_hours * 3600
+    def enhance_chunk(self, audio: np.ndarray, 
+                      suppress_noise: bool = True,
+                      normalize_volume: bool = True,
+                      target_db: float = -20) -> np.ndarray:
+        """
+        Enhance audio chunk in real-time.
+        """
+        if len(audio) < 512:
+            return audio
+        
+        enhanced = audio.copy()
+        
+        try:
+            if suppress_noise:
+                enhanced = self._suppress_noise(enhanced)
+            
+            if normalize_volume:
+                enhanced = self._normalize_volume(enhanced, target_db)
+        except Exception as e:
+            log(f"⚠️ Enhancement error: {e}")
+            return audio
+        
+        return enhanced
     
-    for file_path in temp_dir.glob("*"):
-        if file_path.is_file():
-            file_age = current_time - file_path.stat().st_mtime
-            if file_age > max_age_seconds:
-                try:
-                    file_path.unlink()
-                    print(f"Deleted old temp file: {file_path}")
-                except Exception as e:
-                    print(f"Error deleting {file_path}: {e}")
+    def _suppress_noise(self, audio: np.ndarray) -> np.ndarray:
+        """Apply noise suppression"""
+        try:
+            if self.use_deep_filter and self.df_model is not None:
+                from df import enhance
+                import torch
+                
+                # DeepFilterNet needs 48kHz - resample up, process, resample down
+                audio_48k = librosa.resample(audio, orig_sr=16000, target_sr=48000)
+                
+                # DeepFilterNet expects 2D tensor: (1, samples)
+                audio_tensor = torch.from_numpy(audio_48k).float().unsqueeze(0)
+                
+                # Enhance
+                enhanced_48k = enhance(self.df_model, self.df_state, audio_tensor)
+                
+                # Handle tensor output
+                if isinstance(enhanced_48k, torch.Tensor):
+                    enhanced_48k = enhanced_48k.squeeze().cpu().numpy()
+                else:
+                    enhanced_48k = np.array(enhanced_48k).flatten()
+                
+                # Resample back to 16kHz
+                enhanced = librosa.resample(enhanced_48k, orig_sr=48000, target_sr=16000)
+                
+                return enhanced.astype(np.float32)
+            else:
+                # Fallback to noisereduce
+                import noisereduce as nr
+                return nr.reduce_noise(
+                    y=audio, 
+                    sr=self.sample_rate,
+                    stationary=False,
+                    prop_decrease=0.75,
+                    n_fft=512,
+                    hop_length=128
+                ).astype(np.float32)
+        except Exception as e:
+            log(f"⚠️ Noise suppression failed: {e}")
+            return audio
+    
+    def _normalize_volume(self, audio: np.ndarray, target_db: float = -20) -> np.ndarray:
+        """Normalize volume with soft limiting"""
+        rms = np.sqrt(np.mean(audio ** 2))
+        if rms < 1e-8:
+            return audio
+        
+        current_db = 20 * np.log10(rms + 1e-8)
+        gain_db = target_db - current_db
+        gain_db = np.clip(gain_db, -20, 30)
+        gain = 10 ** (gain_db / 20)
+        
+        amplified = audio * gain
+        amplified = np.tanh(amplified * 0.9) / 0.9
+        
+        return amplified.astype(np.float32)
+    
+# ============== STREAMING ASR SERVICE ==============
+
+class StreamingTranscriptionService:
+    """Real-time streaming ASR with VAD and audio enhancement"""
+    
+    def __init__(self, asr_service: TranscriptionService):
+        self.asr_service = asr_service
+        self.sample_rate = 16000
+        
+        # Load Silero VAD
+        log("Loading Silero VAD model...")
+        import torch
+        self.vad_model, self.vad_utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False
+        )
+        log("✅ VAD model loaded!")
+        
+        # Load Audio Enhancer
+        self.enhancer = AudioEnhancer()
+        
+    def detect_speech_end(self, audio_chunk: np.ndarray, threshold: float = 0.5) -> bool:
+        """Check if speech has ended in the audio chunk"""
+        import torch
+        if len(audio_chunk) < 512:
+            return False
+        
+        audio_tensor = torch.from_numpy(audio_chunk.astype(np.float32))
+        check_samples = min(len(audio_tensor), int(0.5 * self.sample_rate))
+        chunk_to_check = audio_tensor[-check_samples:]
+        
+        speech_prob = self.vad_model(chunk_to_check, self.sample_rate).item()
+        return speech_prob < threshold
+    
+    def transcribe_buffer(self, audio_buffer: np.ndarray) -> str:
+        """Transcribe accumulated audio buffer"""
+        if len(audio_buffer) < self.sample_rate * 0.3:
+            return ""
+        
+        temp_path = Path("temp_streaming") / f"stream_{int(time.time()*1000)}.wav"
+        temp_path.parent.mkdir(exist_ok=True)
+        
+        try:
+            sf.write(str(temp_path), audio_buffer, self.sample_rate)
+            result = self.asr_service.model.transcribe([str(temp_path)])
+            
+            if isinstance(result, list) and len(result) > 0:
+                text = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            else:
+                text = str(result)
+            return text.strip()
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()

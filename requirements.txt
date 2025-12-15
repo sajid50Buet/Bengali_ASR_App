@@ -1,3 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch>=2.2.0
+torchaudio>=2.2.0
+numpy<2.0
 nemo_toolkit[asr]
 fastapi
 python-multipart
@@ -5,3 +10,7 @@ librosa
 soundfile
 uvicorn[standard]
 scipy
+pyannote.audio>=3.1.0
+python-dotenv
+noisereduce
+deepfilternet

@@ -323,6 +323,14 @@
             <button class="tab-btn" onclick="switchTab('record')">🎙️ Record Audio</button>
         </div>
 
+        <!-- Diarization Toggle -->
+        <div style="margin-bottom: 20px; padding: 12px; background: #f8f9ff; border-radius: 10px;">
+            <label style="display: flex; align-items: center; gap: 10px; cursor: pointer;">
+                <input type="checkbox" id="enableDiarization" style="width: 20px; height: 20px;">
+                <span>🎭 <strong>Enable Speaker Diarization</strong> (identifies speakers + timestamps)</span>
+            </label>
+        </div>
+
         <!-- Upload Tab -->
         <div id="upload-tab" class="tab-content active">
             <div class="upload-area" id="uploadArea">
@@ -350,6 +358,21 @@
                     🚀 Transcribe Audio
                 </button>
             </div>
+        </div>
+
+        <!-- Streaming Section -->
+        <div id="streaming-section">
+            <h3>🎙️ Real-time Transcription</h3>
+            
+            <!-- Enhancement Controls -->
+            <label><input type="checkbox" id="noiseSuppressCheck" checked> Noise Suppression</label>
+            <label><input type="checkbox" id="normalizeCheck" checked> Auto Volume</label>
+            <label>Target dB: <input type="range" id="targetDb" min="-30" max="-10" value="-20"></label>
+            
+            <button id="startStream" onclick="startStreaming()">Start Listening</button>
+            <button id="stopStream" onclick="stopStreaming()" disabled>Stop</button>
+            <div id="streamStatus">Ready</div>
+            <div id="streamOutput"></div>
         </div>
 
         <!-- Status Messages -->
@@ -385,6 +408,10 @@
         let recordedBlob = null;
         let processingStartTime = null;
         let processingTimerInterval = null;
+        let ws = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let processor = null;
 
         // Tab Switching
         function switchTab(tab) {
@@ -555,8 +582,12 @@
             const formData = new FormData();
             formData.append('audio', file);
 
+            // Check if diarization is enabled
+            const enableDiarization = document.getElementById('enableDiarization').checked;
+            const endpoint = enableDiarization ? '/transcribe_diarize' : '/transcribe';
+
             try {
-                const response = await fetch('/transcribe', {
+                const response = await fetch(endpoint, {
                     method: 'POST',
                     body: formData
                 });
@@ -567,7 +598,7 @@
                 if (response.ok) {
                     const result = await response.json();
                     showStatus('✅ Transcription completed successfully!', 'success');
-                    displayResults(result);
+                    displayResults(result, enableDiarization);
                 } else {
                     const error = await response.json();
                     showStatus('❌ Transcription failed!', 'error');
@@ -585,13 +616,126 @@
             }
         }
 
+        async function startStreaming() {
+            document.getElementById('startStream').disabled = true;
+            document.getElementById('stopStream').disabled = false;
+            document.getElementById('streamStatus').textContent = '🔴 Listening...';
+
+            const noiseSup = document.getElementById('noiseSuppressCheck').checked;
+            const normalize = document.getElementById('normalizeCheck').checked;
+            const targetDb = document.getElementById('targetDb').value;
+            
+            // Connect WebSocket
+            // Connect with query params
+            ws = new WebSocket(
+                `ws://${window.location.host}/ws/stream?noise_suppress=${noiseSup}&normalize=${normalize}&target_db=${targetDb}`
+            );
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.text && data.is_final) {
+                    // Add new line with timestamp
+                    const output = document.getElementById('streamOutput');
+                    const timestamp = new Date().toLocaleTimeString();
+                    output.innerHTML += `<div>[${timestamp}] ${data.text}</div>`;
+                    // Auto-scroll to bottom
+                    output.scrollTop = output.scrollHeight;
+                } else if (data.status === 'listening') {
+                    document.getElementById('streamStatus').textContent = `🎤 Listening... (${data.buffer_duration}s)`;
+                }
+            };
+            
+            ws.onclose = () => {
+                document.getElementById('streamStatus').textContent = 'Disconnected';
+                stopStreaming();
+            };
+            
+            // Start audio capture
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioContext = new AudioContext({ sampleRate: 16000 });
+            const source = audioContext.createMediaStreamSource(mediaStream);
+            
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+            processor.onaudioprocess = (e) => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const float32Data = e.inputBuffer.getChannelData(0);
+                    const base64Audio = float32ToBase64(float32Data);
+                    ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
+                }
+            };
+            
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+        }
+
+        function stopStreaming() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'stop' }));
+                ws.close();
+            }
+            if (processor) processor.disconnect();
+            if (audioContext) audioContext.close();
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            
+            document.getElementById('startStream').disabled = false;
+            document.getElementById('stopStream').disabled = true;
+            document.getElementById('streamStatus').textContent = 'Ready';
+        }
+
+        function float32ToBase64(float32Array) {
+            const bytes = new Uint8Array(float32Array.buffer);
+            let binary = '';
+            bytes.forEach(b => binary += String.fromCharCode(b));
+            return btoa(binary);
+        }
+
         // Display Results
-        function displayResults(result) {
-            document.getElementById('transcriptionText').textContent = result.transcription || 'No transcription available';
-            document.getElementById('audioDuration').textContent = result.audio_duration + 's';
-            document.getElementById('processingTime').textContent = result.processing_time + 's';
+        function displayResults(result, isDiarized = false) {
+            const transcriptionText = document.getElementById('transcriptionText');
+            
+            if (isDiarized) {
+                // Diarized output with speaker labels and timestamps
+                transcriptionText.innerHTML = formatDiarizedText(result.full_text);
+                document.getElementById('audioDuration').textContent = result.audio_duration.toFixed(2) + 's';
+                document.getElementById('processingTime').textContent = result.processing_time.toFixed(2) + 's';
+                
+                // Show speaker count in status
+                showStatus(`✅ Completed! Found ${result.num_speakers} speaker(s), ${result.segments.length} segments`, 'success');
+            } else {
+                // Simple transcription
+                transcriptionText.textContent = result.transcription || 'No transcription available';
+                document.getElementById('audioDuration').textContent = result.audio_duration.toFixed(2) + 's';
+                document.getElementById('processingTime').textContent = result.processing_time.toFixed(2) + 's';
+            }
+            
             document.getElementById('resultBox').classList.remove('hidden');
         }
+
+        // Format diarized text with colors for different speakers
+        function formatDiarizedText(text) {
+            const colors = ['#667eea', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
+            const lines = text.split('\n');
+            
+            return lines.map(line => {
+                const match = line.match(/\[([\d.]+)s\s*-\s*([\d.]+)s\]\s*(SPEAKER_\d+):\s*(.*)/);
+                if (match) {
+                    const [, start, end, speaker, content] = match;
+                    const speakerNum = parseInt(speaker.split('_')[1]) || 0;
+                    const color = colors[speakerNum % colors.length];
+                    return `
+                        <div style="margin: 8px 0; padding: 12px; border-left: 4px solid ${color}; background: ${color}15; border-radius: 0 8px 8px 0;">
+                            <div style="font-size: 0.8rem; color: #666; margin-bottom: 5px;">
+                                <span style="color: ${color}; font-weight: bold;">${speaker}</span>
+                                <span style="margin-left: 10px;">⏱️ ${start}s - ${end}s</span>
+                            </div>
+                            <div style="color: #333;">${content}</div>
+                        </div>
+                    `;
+                }
+                return `<div>${line}</div>`;
+            }).join('');
+        }
+
 
         // Status Messages
         function showStatus(message, type) {

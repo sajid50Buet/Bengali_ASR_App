@@ -21,10 +21,15 @@ class TranscriptionService:
     
     def __init__(self, model_path: str = None):
         if model_path is None:
-            nemo_files = list(Path('.').glob('*.nemo'))
-            if not nemo_files:
-                raise FileNotFoundError("No .nemo model file found!")
-            model_path = str(nemo_files[0])
+            # Specify your preferred model explicitly
+            model_path = "/mnt/storage2/Sajid/Bengali_ASR_App/bengali_tdt_val_wer_0.2500_compressed.nemo"  # ◄── Change to your best model
+            
+            # Fallback to auto-detect if not found
+            if not Path(model_path).exists():
+                nemo_files = list(Path('.').glob('*.nemo'))
+                if not nemo_files:
+                    raise FileNotFoundError("No .nemo model file found!")
+                model_path = str(nemo_files[0])
         
         log(f"Loading NeMo model: {model_path}")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"

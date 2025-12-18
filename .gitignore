@@ -7,3 +7,7 @@ temp_audio/
 *.ckpt
 
 __init__.py
+
+__pycache__/
+temp_audio/
+temp_streaming/ 

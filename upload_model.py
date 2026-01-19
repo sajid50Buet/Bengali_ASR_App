@@ -1,41 +1,61 @@
 from huggingface_hub import HfApi
+import os
+
+# Load from .env manually
+def load_env():
+    if os.path.exists('.env'):
+        with open('.env') as f:
+            for line in f:
+                if '=' in line and not line.startswith('#'):
+                    key, value = line.strip().split('=', 1)
+                    os.environ[key] = value
+
+load_env()
 
 # --- CONFIGURATION ---
-# Your Repo ID (from your screenshot)
-REPO_ID = "Sajid50/parakeet-bengali-asr"
+REPO_ID = "Sajid50/parakeet_bengali_asr_v2"
+LOCAL_MODEL_FILE = "bengali_tdt_val_wer_0.2500.nemo"
+REMOTE_FILENAME = "parakeet_bengali_asr_v2.nemo"
 
-# The local file you just created with the conversion script
-LOCAL_MODEL_FILE = "parakeet_bengali_tdt_0.6b.nemo"
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-# The name used on HuggingFace (Must match existing file to overwrite it)
-REMOTE_FILENAME = "parakeet-bengali-asr.nemo"
+if not HF_TOKEN:
+    print("❌ No HF_TOKEN in .env!")
+    exit(1)
 
-api = HfApi()
+api = HfApi(token=HF_TOKEN)
 
-print(f"🚀 Connecting to {REPO_ID}...")
+print(f"🚀 Uploading to {REPO_ID}...")
+print("=" * 50)
 
-# 1. Overwrite the Model File
-print(f"☁️  Uploading '{LOCAL_MODEL_FILE}'...")
-print(f"    ↳ Will overwrite: '{REMOTE_FILENAME}'")
+# 1. Upload Model
+if os.path.exists(LOCAL_MODEL_FILE):
+    size_gb = os.path.getsize(LOCAL_MODEL_FILE) / (1024**3)
+    print(f"\n📤 Uploading: {LOCAL_MODEL_FILE} ({size_gb:.2f} GB)...")
+    api.upload_file(
+        path_or_fileobj=LOCAL_MODEL_FILE,
+        path_in_repo=REMOTE_FILENAME,
+        repo_id=REPO_ID,
+        repo_type="model",
+        commit_message="Update model"
+    )
+    print("   ✅ Model uploaded")
+else:
+    print(f"⚠️  Model not found: {LOCAL_MODEL_FILE}")
 
-api.upload_file(
-    path_or_fileobj=LOCAL_MODEL_FILE,
-    path_in_repo=REMOTE_FILENAME,
-    repo_id=REPO_ID,
-    repo_type="model",
-    commit_message="Update model with latest checkpoint (Epoch 10)"
-)
+# 2. Upload Tokenizer folder
+if os.path.exists("tokenizer"):
+    print(f"\n📤 Uploading: tokenizer/...")
+    api.upload_folder(
+        folder_path="tokenizer",
+        path_in_repo="tokenizer",
+        repo_id=REPO_ID,
+        repo_type="model",
+        commit_message="Update tokenizer"
+    )
+    print("   ✅ Tokenizer uploaded")
+else:
+    print("⚠️  Tokenizer folder not found")
 
-# 2. Overwrite the Tokenizer
-# This uploads your local 'tokenizer/' folder and replaces the remote one
-print("☁️  Uploading/Updating tokenizer folder...")
-api.upload_folder(
-    folder_path="tokenizer",
-    path_in_repo="tokenizer",
-    repo_id=REPO_ID,
-    repo_type="model",
-    commit_message="Update tokenizer"
-)
-
-print(f"\n✅ Success! The old model has been replaced.")
-print(f"View here: https://huggingface.co/{REPO_ID}")
+print("\n" + "=" * 50)
+print(f"🎉 Done! https://huggingface.co/{REPO_ID}")

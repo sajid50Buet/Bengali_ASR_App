@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+temp_audio/
+temp_streaming/
+*.log
+.git/
+tokenizer/
+__pycache__/

@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bengali_asr_app:latest
+    volumes:
+      - ./:/app
+    ports:
+      - "8569:8569"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8569/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

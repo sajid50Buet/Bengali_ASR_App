@@ -635,11 +635,17 @@
             document.getElementById('streamStatus').style.background = '#fef3c7';
             document.getElementById('streamStatus').style.color = '#92400e';
             
-            // Clear previous output
             document.getElementById('streamOutput').innerHTML = '';
             
-            // Simple WebSocket connection (no enhancement params needed)
-            ws = new WebSocket(`ws://${window.location.host}/ws/stream`);
+            // [OLD CODE TO REMOVE]
+            // ws = new WebSocket(`ws://${window.location.host}/ws/stream`);
+
+            // [NEW CODE TO ADD]
+            // Automatically choose 'wss://' if the page is https, otherwise 'ws://'
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws/stream`);
+
+            console.log(`🔌 Connecting to WebSocket at: ${protocol}//${window.location.host}/ws/stream`);
             
             ws.onopen = () => {
                 document.getElementById('streamStatus').textContent = '🎤 Listening... Speak now!';
@@ -651,42 +657,55 @@
                 const data = JSON.parse(event.data);
                 if (data.text && data.is_final) {
                     const output = document.getElementById('streamOutput');
-                    // Clear placeholder if first result
                     if (output.innerHTML.includes('Transcriptions will appear')) {
                         output.innerHTML = '';
                     }
                     const timestamp = new Date().toLocaleTimeString();
                     output.innerHTML += `<div style="padding: 8px; margin: 5px 0; background: #f0f9ff; border-radius: 8px; border-left: 3px solid #667eea;">[${timestamp}] ${data.text}</div>`;
                     output.scrollTop = output.scrollHeight;
-                } else if (data.status === 'listening') {
-                    document.getElementById('streamStatus').textContent = `🎤 Recording... (${data.buffer_duration}s)`;
                 }
             };
             
-            ws.onerror = (error) => {
+            ws.onerror = () => {
                 document.getElementById('streamStatus').textContent = '❌ Connection error';
                 document.getElementById('streamStatus').style.background = '#fee2e2';
                 document.getElementById('streamStatus').style.color = '#991b1b';
             };
             
             ws.onclose = () => {
-                document.getElementById('streamStatus').textContent = 'Disconnected';
                 stopStreaming();
             };
             
             try {
-                // Start audio capture at 16kHz
+                // Get microphone with browser's built-in processing
                 mediaStream = await navigator.mediaDevices.getUserMedia({ 
-                    audio: { 
+                    audio: {
                         sampleRate: 16000,
                         channelCount: 1,
-                        echoCancellation: true,
-                        noiseSuppression: true  // Browser's built-in noise suppression
-                    } 
+                        echoCancellation: true,      // Remove echo
+                        noiseSuppression: true,      // Reduce background noise
+                        autoGainControl: true        // Auto volume adjustment
+                    }
                 });
                 
                 audioContext = new AudioContext({ sampleRate: 16000 });
                 const source = audioContext.createMediaStreamSource(mediaStream);
+                
+                // Add gain node for volume boost
+                const gainNode = audioContext.createGain();
+                gainNode.gain.value = 1.5;  // 1.5x volume boost (adjust as needed)
+                
+                // Add compressor for consistent volume
+                const compressor = audioContext.createDynamicsCompressor();
+                compressor.threshold.value = -50;
+                compressor.knee.value = 40;
+                compressor.ratio.value = 12;
+                compressor.attack.value = 0;
+                compressor.release.value = 0.25;
+                
+                // Connect: source → gain → compressor → processor
+                source.connect(gainNode);
+                gainNode.connect(compressor);
                 
                 processor = audioContext.createScriptProcessor(4096, 1, 1);
                 processor.onaudioprocess = (e) => {
@@ -697,7 +716,7 @@
                     }
                 };
                 
-                source.connect(processor);
+                compressor.connect(processor);
                 processor.connect(audioContext.destination);
                 
             } catch (err) {

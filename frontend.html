@@ -637,7 +637,15 @@
             
             document.getElementById('streamOutput').innerHTML = '';
             
-            ws = new WebSocket(`ws://${window.location.host}/ws/stream`);
+            // [OLD CODE TO REMOVE]
+            // ws = new WebSocket(`ws://${window.location.host}/ws/stream`);
+
+            // [NEW CODE TO ADD]
+            // Automatically choose 'wss://' if the page is https, otherwise 'ws://'
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws/stream`);
+
+            console.log(`🔌 Connecting to WebSocket at: ${protocol}//${window.location.host}/ws/stream`);
             
             ws.onopen = () => {
                 document.getElementById('streamStatus').textContent = '🎤 Listening... Speak now!';

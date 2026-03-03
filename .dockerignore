@@ -10,4 +10,5 @@ temp_streaming/
 *.log
 .git/
 tokenizer/
-__pycache__/
+.cache/
+*.nemo

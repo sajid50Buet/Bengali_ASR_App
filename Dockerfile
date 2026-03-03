@@ -1,56 +1,48 @@
-# 1. Base Image: Official NVIDIA CUDA (No Python installed)
+# 1. Base Image
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PIP_DEFAULT_TIMEOUT=1000
 
-# 2. Install Python 3.10 and Build Tools
+# 2. Install System Dependencies & Python 3.11 PPA
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 \
-    python3.10-dev \
-    python3-pip \
-    python3.10-venv \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    python3.11-distutils \
     ffmpeg \
     libsndfile1 \
     git \
+    curl \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Link python3 to python
-RUN ln -s /usr/bin/python3.10 /usr/bin/python
+# 3. Link python3 to python3.11
+# We force the system to see python3.11 as the default "python"
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
 
 WORKDIR /app
 
-# 4. Create and Activate Virtual Environment
+# 4. Create Virtual Environment
 ENV VIRTUAL_ENV=/opt/venv
 RUN python -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# 5. Upgrade pip/setuptools (Critical for Cython compatibility)
+# 5. Upgrade pip (Critical for 3.11)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# 6. Install Build Dependencies Manually
-# We install a modern Cython here to fix the "METH_METHOD" crash
-RUN pip install --no-cache-dir "Cython>=3.0.0" numpy
+# 6. Install Frozen Requirements
+COPY frozen_requirements.txt .
+RUN pip install --no-cache-dir -r frozen_requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
 
-# 7. Install ctc-segmentation with --no-build-isolation
-# This tells pip: "Don't download your own Cython. Use the one I just installed."
-RUN CFLAGS="-O0" pip install --no-cache-dir ctc-segmentation --no-build-isolation
-
-# 8. Install PyTorch Trinity (CUDA 12.4)
-RUN pip install --no-cache-dir \
-    torch==2.4.1+cu124 \
-    torchaudio==2.4.1+cu124 \
-    torchvision==0.19.1+cu124 \
-    --extra-index-url https://download.pytorch.org/whl/cu124
-
-# 9. Install remaining requirements
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
-
-# 10. Copy Code
+# 7. Copy Code & Setup Dirs
 COPY . .
+RUN mkdir -p temp_audio temp_streaming
 
 EXPOSE 8569
 

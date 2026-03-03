@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from fastapi import UploadFile
 import librosa
+import shutil
 import nemo.collections.asr as nemo_asr
 import torch
 import soundfile as sf
@@ -15,60 +16,12 @@ def log(message):
     """Print message with timestamp"""
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{timestamp}] {message}")
-
-
-# class TranscriptionService:
-#     """Service for handling Bengali audio transcription"""
-    
-#     def __init__(self, model_path: str = None):
-#         if model_path is None:
-#             model_path = "bengali_tdt_val_wer_0.2500_compressed.nemo"
-            
-#             if not Path(model_path).exists():
-#                 nemo_files = list(Path('.').glob('*.nemo'))
-#                 if not nemo_files:
-#                     raise FileNotFoundError("No .nemo model file found!")
-#                 model_path = str(nemo_files[0])
-        
-#         log(f"Loading NeMo model: {model_path}")
-#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-#         log(f"Using device: {self.device}")
-        
-#         self.model = nemo_asr.models.ASRModel.restore_from(model_path)
-#         if self.device == "cuda":
-#             self.model = self.model.cuda()
-#         self.model.eval()
-#         torch.set_grad_enabled(False)
-#         log("✅ Model loaded successfully!")
-
-#     def transcribe(self, audio_path: str) -> dict:
-#         """Transcribe audio file"""
-#         try:
-#             log(f"🎤 Starting transcription: {audio_path}")
-#             start_time = time.time()
-            
-#             transcriptions = self.model.transcribe([audio_path])
-            
-#             if isinstance(transcriptions, list) and len(transcriptions) > 0:
-#                 result = transcriptions[0]
-#                 text = result.text if hasattr(result, 'text') else str(result)
-#             else:
-#                 text = str(transcriptions)
-            
-#             processing_time = time.time() - start_time
-#             log(f"✅ Transcription completed in {processing_time:.2f}s")
-            
-#             return {"text": text, "processing_time": processing_time}
-#         except Exception as e:
-#             log(f"❌ Error during transcription: {str(e)}")
-#             raise Exception(f"Transcription failed: {str(e)}")
-
 class TranscriptionService:
     """Service for handling Bengali audio transcription"""
     
     def __init__(self, model_path: str = None):
         if model_path is None:
-            model_path = "bengali_tdt_val_wer_0.2500_compressed.nemo"
+            model_path = "models/bengali_tdt_val_wer_0.2500_compressed.nemo"
             
             if not Path(model_path).exists():
                 nemo_files = list(Path('.').glob('*.nemo'))
@@ -123,7 +76,7 @@ class TranscriptionService:
         return str(result)
     
     def _transcribe_chunked(self, audio_path: str, chunk_duration: float = 30.0) -> str:
-        """Transcribe long audio by chunking with overlap"""
+        """Transcribe long audio by chunking with overlap using batch processing"""
         # Load audio
         audio, sr = librosa.load(audio_path, sr=16000, mono=True)
         
@@ -144,23 +97,48 @@ class TranscriptionService:
         
         log(f"   Split into {len(chunks)} chunks")
         
-        # Transcribe each chunk
         temp_dir = Path("temp_chunks")
         temp_dir.mkdir(exist_ok=True)
         
         transcriptions = []
-        for i, chunk in enumerate(chunks):
-            log(f"   Transcribing chunk {i+1}/{len(chunks)}...")
-            chunk_path = temp_dir / f"chunk_{i}.wav"
-            sf.write(str(chunk_path), chunk, sr)
+        try:
+            # 1. SAVE ALL CHUNKS TO DISK FIRST
+            chunk_paths = []
+            for i, chunk in enumerate(chunks):
+                chunk_path = temp_dir / f"chunk_{i}.wav"
+                sf.write(str(chunk_path), chunk, sr)
+                chunk_paths.append(str(chunk_path))
             
-            try:
-                text = self._transcribe_single(str(chunk_path))
+            # 2. TRANSCRIBE ALL CHUNKS IN ONE SINGLE BATCH
+            log(f"   Transcribing {len(chunk_paths)} chunks in batch...")
+            # batch_size handles speed, return_hypotheses=False stops the memory leak
+            batch_results = self.model.transcribe(
+                chunk_paths, 
+                batch_size=4, 
+                return_hypotheses=False
+            )
+            
+            # 3. EXTRACT TEXT
+            for result in batch_results:
+                text = result.text if hasattr(result, 'text') else str(result)
                 transcriptions.append(text)
-            finally:
-                chunk_path.unlink(missing_ok=True)
-        
-        temp_dir.rmdir()
+                
+        finally:
+            import shutil
+            import gc
+            
+            # 1. Clean up files
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+            # 2. Aggressive VRAM Cleanup
+            for var in ['audio', 'chunk', 'batch_results']:
+                if var in locals():
+                    del locals()[var]
+            
+            gc.collect()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # Merge transcriptions with overlap handling
         return self._merge_transcriptions(transcriptions)
@@ -249,7 +227,7 @@ class DiarizedTranscriptionService:
         merge_same_speaker: bool = True,
         gap_threshold: float = 0.5
     ) -> dict:
-        """Transcribe audio with speaker labels and timestamps"""
+        """Transcribe audio with speaker labels and timestamps using batch processing"""
         log(f"🎤 Starting diarized transcription: {audio_path}")
         start_time = time.time()
         
@@ -272,24 +250,33 @@ class DiarizedTranscriptionService:
         # Load audio
         audio, sr = librosa.load(audio_path, sr=16000, mono=True)
         
-        # Transcribe each segment
         temp_dir = Path("temp_diarization")
         temp_dir.mkdir(exist_ok=True)
         
         results = []
-        for i, seg in enumerate(segments):
-            log(f"   [{i+1}/{len(segments)}] {seg['speaker']} ({seg['start']:.1f}s-{seg['end']:.1f}s)")
+        try:
+            # 1. SAVE ALL CHUNKS TO DISK FIRST
+            segment_paths = []
+            for i, seg in enumerate(segments):
+                log(f"   [{i+1}/{len(segments)}] Preparing {seg['speaker']} ({seg['start']:.1f}s-{seg['end']:.1f}s)")
+                segment_audio = audio[int(seg["start"] * sr):int(seg["end"] * sr)]
+                segment_path = temp_dir / f"seg_{i}.wav"
+                sf.write(str(segment_path), segment_audio, sr)
+                segment_paths.append(str(segment_path))
             
-            segment_audio = audio[int(seg["start"] * sr):int(seg["end"] * sr)]
-            segment_path = temp_dir / f"seg_{i}.wav"
-            sf.write(str(segment_path), segment_audio, sr)
+            # 2. TRANSCRIBE ALL CHUNKS IN ONE SINGLE BATCH
+            log(f"   Transcribing {len(segment_paths)} segments in batch...")
+            # batch_size handles speed, return_hypotheses=False stops the memory leak
+            transcriptions = self.asr_service.model.transcribe(
+                segment_paths, 
+                batch_size=4, 
+                return_hypotheses=False 
+            )
             
-            try:
-                transcription = self.asr_service.model.transcribe([str(segment_path)])
-                if isinstance(transcription, list) and transcription:
-                    text = transcription[0].text if hasattr(transcription[0], 'text') else str(transcription[0])
-                else:
-                    text = str(transcription)
+            # 3. MATCH TRANSCRIPTIONS BACK TO SPEAKERS
+            for i, seg in enumerate(segments):
+                trans_obj = transcriptions[i]
+                text = trans_obj.text if hasattr(trans_obj, 'text') else str(trans_obj)
                 
                 results.append({
                     "speaker": seg["speaker"],
@@ -297,17 +284,33 @@ class DiarizedTranscriptionService:
                     "end": round(seg["end"], 2),
                     "text": text.strip()
                 })
-            finally:
-                segment_path.unlink(missing_ok=True)
-        
-        temp_dir.rmdir()
-        
+                
+        finally:
+            import shutil
+            import gc
+            
+            # 1. Clean up files
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+            # 2. Aggressive VRAM Cleanup
+            # Explicitly delete heavy local variables if they exist in locals()
+            for var in ['audio', 'segment_audio', 'diarization_result', 'transcriptions']:
+                if var in locals():
+                    del locals()[var]
+                    
+            # Force Python garbage collector to run
+            gc.collect()
+            
+            # Force PyTorch to release the reserved memory back to NVIDIA
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
         # Merge same-speaker segments
         if merge_same_speaker:
             results = self._merge_same_speaker(results, gap_threshold)
         
         processing_time = time.time() - start_time
-        log(f"✅ Diarized transcription completed in {processing_time:.2f}s")
+        log(f"✅ Diarized transcription completed in {processing_time:.2f}s. VRAM cleared.")
         
         return {
             "segments": results,
@@ -361,7 +364,9 @@ class StreamingTranscriptionService:
         
         try:
             sf.write(str(temp_path), audio_buffer, self.sample_rate)
-            result = self.asr_service.model.transcribe([str(temp_path)])
+            # [FIX] Explicitly disable gradients during inference
+            with torch.no_grad():
+                result = self.asr_service.model.transcribe([str(temp_path)])
             if isinstance(result, list) and result:
                 return (result[0].text if hasattr(result[0], 'text') else str(result[0])).strip()
             return ""
@@ -412,3 +417,23 @@ def get_audio_duration(audio_path: str) -> float:
         return librosa.get_duration(path=audio_path)
     except:
         return 0.0
+    
+def is_valid_transcription(text: str) -> bool:
+    """Filter out garbage text from hallucinations"""
+    if not text:
+        return False
+    text = text.strip()
+    
+    # 1. Ignore very short outputs (often just noise interpreted as a letter)
+    if len(text) < 2: 
+        return False
+        
+    # 2. Ignore output that is ONLY punctuation
+    if all(char in ". ,!?।" for char in text): 
+        return False
+        
+    # 3. (Optional) Ignore common hallucination phrases if you notice them
+    # garbage_phrases = ["Thank you", "Subtitles by", "."]
+    # if text in garbage_phrases: return False
+    
+    return True

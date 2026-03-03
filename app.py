@@ -148,6 +148,8 @@ async def websocket_stream(websocket: WebSocket):
     """
     await websocket.accept()
     log("🔌 WebSocket connected")
+
+    import torch  # Make sure this is imported
     
     audio_buffer = np.array([], dtype=np.float32)
     pre_buffer = np.array([], dtype=np.float32)
@@ -171,11 +173,12 @@ async def websocket_stream(websocket: WebSocket):
                     vad_chunk = pre_buffer[:VAD_CHUNK_SIZE]
                     pre_buffer = pre_buffer[VAD_CHUNK_SIZE:]
                     
-                    # VAD check
-                    import torch
-                    speech_prob = streaming_service.vad_model(
-                        torch.from_numpy(vad_chunk), 16000
-                    ).item()
+                    # [CRITICAL FIX START] Wrap inference in no_grad()
+                    with torch.no_grad():
+                        speech_prob = streaming_service.vad_model(
+                            torch.from_numpy(vad_chunk), 16000
+                        ).item()
+                    # [CRITICAL FIX END]
                     
                     if speech_prob > 0.5:
                         silence_frames = 0
@@ -208,6 +211,15 @@ async def websocket_stream(websocket: WebSocket):
                 
     except WebSocketDisconnect:
         log("🔌 Disconnected")
+
+        # [FIX] Release memory when user leaves
+        del audio_buffer
+        del pre_buffer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            
     except Exception as e:
         log(f"❌ Error: {e}")
 

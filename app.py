@@ -3,18 +3,23 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query, WebSocket, 
 from fastapi.responses import HTMLResponse, JSONResponse
 from contextlib import asynccontextmanager
 import os
+import asyncio
 import numpy as np
 import base64
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse as StarletteJSONResponse
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from utils import (
-    TranscriptionService, 
+    TranscriptionService,
     DiarizedTranscriptionService,
     StreamingTranscriptionService,
-    save_uploaded_file, 
-    get_audio_duration, 
+    save_uploaded_file,
+    get_audio_duration,
     log
 )
 
@@ -24,6 +29,24 @@ diarized_service = None
 streaming_service = None
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
+
+# --- Request timeout middleware ---
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "120"))  # seconds
+
+class TimeoutMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT)
+        except asyncio.TimeoutError:
+            log(f"⏰ Request timed out after {REQUEST_TIMEOUT}s: {request.url.path}")
+            return StarletteJSONResponse(
+                status_code=504,
+                content={"detail": f"Request timed out after {REQUEST_TIMEOUT}s"}
+            )
+
+# --- Concurrency limiter for GPU-bound endpoints ---
+MAX_CONCURRENT_TRANSCRIPTIONS = int(os.getenv("MAX_CONCURRENT_TRANSCRIPTIONS", "3"))
+transcription_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
 
 
 @asynccontextmanager
@@ -52,6 +75,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Bengali Audio Transcription API", lifespan=lifespan)
+app.add_middleware(TimeoutMiddleware)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -64,16 +88,17 @@ async def read_root():
 async def transcribe_audio(audio: UploadFile = File(...)):
     """Simple transcription"""
     log(f"📨 Received: {audio.filename}")
-    
+
     if not audio.filename.endswith(('.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm')):
         raise HTTPException(status_code=400, detail="Invalid file format")
-    
+
     audio_path = None
     try:
-        audio_path = await save_uploaded_file(audio)
-        duration = get_audio_duration(audio_path)
-        result = transcription_service.transcribe(audio_path)
-        
+        async with transcription_semaphore:
+            audio_path = await save_uploaded_file(audio)
+            duration = get_audio_duration(audio_path)
+            result = transcription_service.transcribe(audio_path)
+
         return JSONResponse(content={
             "transcription": result["text"],
             "audio_duration": float(duration),
@@ -106,16 +131,17 @@ async def transcribe_with_diarization(
     
     audio_path = None
     try:
-        audio_path = await save_uploaded_file(audio)
-        duration = get_audio_duration(audio_path)
-        
-        result = diarized_service.transcribe_with_diarization(
-            audio_path,
-            min_segment_duration=min_segment_duration,
-            merge_same_speaker=merge_same_speaker,
-            gap_threshold=gap_threshold
-        )
-        
+        async with transcription_semaphore:
+            audio_path = await save_uploaded_file(audio)
+            duration = get_audio_duration(audio_path)
+
+            result = diarized_service.transcribe_with_diarization(
+                audio_path,
+                min_segment_duration=min_segment_duration,
+                merge_same_speaker=merge_same_speaker,
+                gap_threshold=gap_threshold
+            )
+
         return JSONResponse(content={
             "segments": result["segments"],
             "full_text": result["full_text"],
